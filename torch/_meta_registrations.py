@@ -750,8 +750,8 @@ def squareCheckInputs(self: Tensor, f_name: str):
     assert (
         self.dim() >= 2
     ), f"{f_name}: The input tensor must have at least 2 dimensions."
-    assert (
-        self.size(-1) == self.size(-2)
+    assert self.size(-1) == self.size(
+        -2
     ), f"{f_name}: A must be batches of square matrices, but they are {self.size(-2)} by {self.size(-1)} matrices"
 
 
@@ -2246,6 +2246,131 @@ def is_channels_last(ten):
     return torch._prims_common.suggest_memory_format(ten) == torch.channels_last
 
 
+def check_conv_nd_params(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    stride: Union[List[int], int],
+    padding: Union[List[int], int],
+    dilation: Union[List[int], int],
+    is_transposed: bool,
+    groups: int,
+):
+    """
+    Check the shapes of the conv inputs. This is a 1:1 copy of the checks in the 
+    aten aten/src/ATen/native/Convolution.cpp check_shape_forward method.
+    """   
+
+    # Check for negative padding
+    torch._check(
+        all(p >= 0 for p in padding), lambda: "negative padding is not supported"
+    )
+
+    # Check for non-positive stride
+    torch._check(
+        all(s > 0 for s in stride), lambda: "non-positive stride is not supported"
+    )
+
+    # Check for negative dilation
+    torch._check(
+        all(d > 0 for d in dilation), lambda: "dilation should be greater than zero"
+    )
+
+    # Check that the weight tensor has the correct dimensionality
+    weight_dim = weight.dim()
+    input_dim = input_tensor.dim()
+
+    weight_sizes = list(weight.size())
+    input_sizes = list(input_tensor.size())
+
+    torch._check(
+        weight_dim == input_dim,
+        lambda: f"Expected {weight_dim}-dimensional input for {weight_dim}-dimensional weight "
+        f"{list(weight.size())}, but got {input_dim}-dimensional input of size {list(input_tensor.size())} instead",
+    )
+
+    # Check that the first dimension of weight is at least as large as the number of groups
+    weight_sizes = weight.size()
+    torch._check(
+        weight_sizes[0] >= groups,
+        lambda: f"Given groups={groups}, expected weight to be at least {groups} at dimension 0, "
+        f"but got weight of size {weight_sizes} instead",
+    )
+
+    # Check that the first dimension of weight is divisible by the number of groups
+    torch._check(
+        weight_sizes[0] % groups == 0,
+        lambda: f"Given groups={groups}, expected weight to be divisible by {groups} at dimension 0, "
+        f"but got weight of size {weight_sizes} instead",
+    )
+
+    if not is_transposed:
+        # Check input channels match weight channels * groups
+        torch._check(
+            input_tensor.size(1) == (weight_sizes[1] * groups),
+            lambda: f"Given groups={groups}, weight of size {weight_sizes}, expected input"
+            f" {input_sizes} to have {weight_sizes[1] * groups} channels, but got "
+            f"{input_tensor.size(1)} channels instead",
+        )
+
+        # Check bias is either undefined or has the correct size
+        torch._check(
+            bias is None or (bias.dim() == 1 and bias.size(0) == weight_sizes[0]),
+            lambda: f"Given weight of size {weight_sizes}, expected bias to be 1-dimensional with "
+            f"{weight_sizes[0]} elements, but got bias of size {list(bias.size())} instead",
+        )
+
+        # Compute the input shape and kernel shape, considering padding and dilation
+        input_shape = []
+        kernel_shape = []
+        kernel_size_correct = True
+
+        for i in range(2, input_tensor.ndim):
+            input_dim_with_padding = input_tensor.size(i) + 2 * padding[i - 2]
+            kernel_dim_with_dilation = dilation[i - 2] * (weight_sizes[i] - 1) + 1
+
+            input_shape.append(input_dim_with_padding)
+            kernel_shape.append(kernel_dim_with_dilation)
+
+            if input_dim_with_padding < kernel_dim_with_dilation:
+                kernel_size_correct = False
+
+        # Check that the input shape and kernel shape have consistent sizes
+        torch._check(
+            len(input_shape) == len(kernel_shape),
+            lambda: "Inconsistent shape between Input and Kernel",
+        )
+
+        # Check if the kernel size is greater than the input size
+        if not kernel_size_correct:
+            input_str = " x ".join(map(str, input_shape))
+            kernel_str = " x ".join(map(str, kernel_shape))
+
+            torch._check(
+                False,
+                lambda: f"Calculated padded input size per channel: ({input_str}). "
+                f"Kernel size: ({kernel_str}). Kernel size can't be greater than actual input size.",
+            )
+
+    else:  # transposed convolution
+        # Check input channels match weight's first dimension (for transposed convolutions)
+        torch._check(
+            input_tensor.size(1) == weight_sizes[0],
+            lambda: f"Given transposed={is_transposed}, weight of size {weight_sizes}, expected input"
+            f" {input_sizes} to have {weight_sizes[0]} channels, but got "
+            f"{input_tensor.size(1)} channels instead",
+        )
+
+        # Check bias is either undefined or has the correct size
+        torch._check(
+            bias is None
+            or (bias.dim() == 1 and bias.size(0) == weight_sizes[1] * groups),
+            lambda: f"Given transposed={is_transposed}, weight of size {weight_sizes}, expected bias to be "
+            f"1-dimensional with {weight_sizes[1] * groups} elements, but got bias of size "
+            f"{list(bias.size())} instead",
+        )
+
+
 @register_meta(aten.convolution.default)
 def meta_conv(
     input_tensor: torch.Tensor,
@@ -2270,6 +2395,9 @@ def meta_conv(
         elif input_tensor.is_contiguous(memory_format=torch.preserve_format):
             return torch.preserve_format
 
+    check_conv_nd_params(
+        input_tensor, weight, bias, stride, padding, dilation, is_transposed, groups
+    )
     shape_out = calc_conv_nd_return_shape(
         input_tensor,
         weight,
@@ -6259,15 +6387,12 @@ def nan_to_num(self, nan=None, posinf=None, neginf=None):
 
 @register_meta(torch.ops.aten.transpose_)
 def transpose_(self, dim0, dim1):
-    assert (
-        self.layout
-        not in {
-            torch.sparse_csr,
-            torch.sparse_csc,
-            torch.sparse_bsr,
-            torch.sparse_bsc,
-        }
-    ), f"torch.transpose_: in-place transposition is not supported for {self.layout} layout"
+    assert self.layout not in {
+        torch.sparse_csr,
+        torch.sparse_csc,
+        torch.sparse_bsr,
+        torch.sparse_bsc,
+    }, f"torch.transpose_: in-place transposition is not supported for {self.layout} layout"
 
     ndims = self.ndim
 
@@ -6668,18 +6793,15 @@ def activate_meta():
             # We shouldn't do this, because the output will report as not having aliased storages.
             # All view ops have meta kernels in C++ today, so we should use those instead.
             pass
-        elif (
-            op_overload.name()
-            in {
-                "aten::empty_strided",  # causing infinite recursion, test_meta.py
-                "aten::clone",  # causing infinite recursion
-                "aten::_to_copy",  # causing infinite recursion, test_serialization.py -k test_tensor_subclass_getstate_overwrite  # noqa: B950
-                "aten::copy_",  # Exception not raised, test_torch.py -k test_storage_meta_errors_cpu_int64  # noqa: B950
-                "aten::constant_pad_nd",  # requires_grad mismatch, test_ops.py -k test_fake_crossref_backward_amp_istft_cuda_float32  # noqa: B950
-                "aten::rot90",  # requires_grad mismatch! test_ops.py -k test_fake_crossref_backward_amp_rot90_cuda_float32  # noqa: B950
-                "aten::as_strided_scatter",  # requires_grad mismatch, test_ops.py -k test_fake_crossref_backward_no_amp_as_strided_scatter_cuda_float32  # noqa: B950
-            }
-        ):
+        elif op_overload.name() in {
+            "aten::empty_strided",  # causing infinite recursion, test_meta.py
+            "aten::clone",  # causing infinite recursion
+            "aten::_to_copy",  # causing infinite recursion, test_serialization.py -k test_tensor_subclass_getstate_overwrite  # noqa: B950
+            "aten::copy_",  # Exception not raised, test_torch.py -k test_storage_meta_errors_cpu_int64  # noqa: B950
+            "aten::constant_pad_nd",  # requires_grad mismatch, test_ops.py -k test_fake_crossref_backward_amp_istft_cuda_float32  # noqa: B950
+            "aten::rot90",  # requires_grad mismatch! test_ops.py -k test_fake_crossref_backward_amp_rot90_cuda_float32  # noqa: B950
+            "aten::as_strided_scatter",  # requires_grad mismatch, test_ops.py -k test_fake_crossref_backward_no_amp_as_strided_scatter_cuda_float32  # noqa: B950
+        }:
             pass
         else:
             if "mkldnn::" in op_overload.name():
